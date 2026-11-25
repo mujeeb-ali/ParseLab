@@ -473,6 +473,8 @@ def analyze_slr(grammar_text: str, input_text: str = "") -> dict[str, Any]:
         "automaton": automaton,
         "table": table,
         "isSLR": table["isSLR"],
+        "deterministic": table["isSLR"],
+        "method": "slr",
         "conflicts": table["conflicts"],
         "stats": {
             "states": len(automaton["states"]),

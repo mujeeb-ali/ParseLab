@@ -86,6 +86,10 @@ def build_table(analysis: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _row_for(table: dict[str, Any], nt: str) -> dict[str, Any] | None:
+    return next((row for row in table["rows"] if row["nonterminal"] == nt), None)
+
+
 def _cell_for(table: dict[str, Any], nt: str, terminal: str) -> dict[str, Any] | None:
     for row in table["rows"]:
         if row["nonterminal"] == nt:
@@ -212,11 +216,35 @@ def simulate(
             )
             break
 
+        if symbol == EOF:
+            error = (
+                f"The stack is down to $ but input remains, starting at '{lookahead}'. "
+                f"The start symbol derived a complete sentence too early; the extra tokens are not part of it."
+            )
+            steps.append(
+                {
+                    "index": len(steps),
+                    "stack": snapshot(),
+                    "input": stream[i:],
+                    "lookahead": lookahead,
+                    "action": "error",
+                    "production": None,
+                    "nodeId": None,
+                    "created": [],
+                    "consumed": i,
+                    "explanation": error,
+                    "tableCell": None,
+                }
+            )
+            break
+
         cell = _cell_for(table, symbol, lookahead)
         if cell is None or cell["production"] is None:
+            expected = [c["column"] for c in (_row_for(table, symbol) or {}).get("cells", []) if c["production"] is not None]
             error = (
                 f"No LL(1) table entry for [{symbol}, {lookahead}]. "
                 f"The parser cannot decide how to expand {symbol} when it sees {lookahead}."
+                + (f" Expected one of: {', '.join(expected)}." if expected else "")
             )
             steps.append(
                 {

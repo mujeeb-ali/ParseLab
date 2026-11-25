@@ -10,8 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .core.grammar import analyze_grammar, left_factor
+from .core.grammar import GrammarError, analyze_grammar, parse_grammar, sample_sentences, eliminate_left_recursion, left_factor
 from .core.lexer import analyze_lexer
+from .core.lr1 import analyze_lr, classify_grammar
 from .core.ll1 import analyze_ll1
 from .core.regex_engine import analyze_regex
 from .core.slr import analyze_slr
@@ -27,6 +28,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:4173"],
+    allow_origin_regex=r"http://(192\.168|10\.\d+|172\.(1[6-9]|2\d|3[01]))\.\d+\.\d+:(5173|4173)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,12 +38,18 @@ ENGINE_MODULES = [
     "regex",
     "thompson-nfa",
     "subset-construction",
+    "dfa-minimization",
     "lexer",
     "grammar",
     "first-follow",
+    "left-factoring",
+    "left-recursion-elimination",
     "ll1",
     "lr0",
     "slr",
+    "lalr",
+    "canonical-lr1",
+    "parser-classification",
     "parse-tree",
     "time-machine",
 ]
@@ -110,6 +118,29 @@ def grammar_factor(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     return left_factor(text)
 
 
+@app.post("/api/grammar/samples")
+def grammar_samples(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    text = payload.get("grammar")
+    seed = payload.get("seed", 0)
+    if not isinstance(text, str):
+        raise HTTPException(status_code=422, detail="Field 'grammar' must be a string.")
+    if not isinstance(seed, int):
+        raise HTTPException(status_code=422, detail="Field 'seed' must be an integer.")
+    try:
+        g = parse_grammar(text)
+    except GrammarError as exc:
+        return {"valid": False, "errors": exc.errors, "samples": []}
+    return {"valid": True, "samples": sample_sentences(g, seed=seed)}
+
+
+@app.post("/api/grammar/left-recursion")
+def grammar_left_recursion(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    text = payload.get("grammar")
+    if not isinstance(text, str):
+        raise HTTPException(status_code=422, detail="Field 'grammar' must be a string.")
+    return eliminate_left_recursion(text)
+
+
 @app.post("/api/ll1/analyze")
 def ll1_analyze(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     text = payload.get("grammar")
@@ -130,6 +161,28 @@ def slr_analyze(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     if not isinstance(input_text, str):
         raise HTTPException(status_code=422, detail="Field 'input' must be a string.")
     return analyze_slr(text, input_text)
+
+
+@app.post("/api/lr/analyze")
+def lr_analyze(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    text = payload.get("grammar")
+    if not isinstance(text, str):
+        raise HTTPException(status_code=422, detail="Field 'grammar' must be a string.")
+    input_text = payload.get("input", "")
+    if not isinstance(input_text, str):
+        raise HTTPException(status_code=422, detail="Field 'input' must be a string.")
+    method = payload.get("method", "lalr")
+    if not isinstance(method, str):
+        raise HTTPException(status_code=422, detail="Field 'method' must be a string.")
+    return analyze_lr(text, input_text, method)
+
+
+@app.post("/api/grammar/classify")
+def grammar_classify(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    text = payload.get("grammar")
+    if not isinstance(text, str):
+        raise HTTPException(status_code=422, detail="Field 'grammar' must be a string.")
+    return classify_grammar(text)
 
 
 @app.post("/api/timemachine")

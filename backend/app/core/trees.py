@@ -25,6 +25,7 @@ class TreeBuilder:
             "productionText": None,
             "createdStep": created_step,
             "matchedStep": None,
+            "expandedStep": None,
         }
         if parent is not None:
             self.nodes[parent]["children"].append(nid)
@@ -33,6 +34,7 @@ class TreeBuilder:
     def expand(self, node_id: int, production: dict[str, Any], step: int, is_terminal) -> list[int]:
         self.nodes[node_id]["productionIndex"] = production["index"]
         self.nodes[node_id]["productionText"] = production["text"]
+        self.nodes[node_id]["expandedStep"] = step
         created = []
         for sym in production["rhs"]:
             created.append(self.create(sym, is_terminal(sym), step, node_id))
@@ -51,6 +53,7 @@ class TreeBuilder:
             self.nodes[cid]["parent"] = nid
         self.nodes[nid]["productionIndex"] = production["index"]
         self.nodes[nid]["productionText"] = production["text"]
+        self.nodes[nid]["expandedStep"] = step
         return nid
 
     def nested(self, node_id: int | None = None) -> dict[str, Any] | None:
@@ -65,6 +68,7 @@ class TreeBuilder:
             "productionText": node["productionText"],
             "createdStep": node["createdStep"],
             "matchedStep": node["matchedStep"],
+            "expandedStep": node["expandedStep"],
             "children": [self.nested(c) for c in node["children"]],
         }
 

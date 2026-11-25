@@ -6,7 +6,7 @@ import bisect
 import time
 from typing import Any
 
-from .regex_engine import analyze_regex, longest_dfa_match
+from .regex_engine import analyze_regex, compile_dfa, longest_dfa_match
 
 
 def _line_starts(source: str) -> list[int]:
@@ -82,6 +82,7 @@ def analyze_lexer(source: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
         compiled.append(entry)
 
     valid_rules = [r for r in compiled if r["valid"] and r["dfa"] is not None]
+    machines = {r["index"]: compile_dfa(r["dfa"]) for r in valid_rules}
     starts = _line_starts(source)
     tokens: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -94,7 +95,7 @@ def analyze_lexer(source: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
         candidates: list[dict[str, Any]] = []
         best: dict[str, Any] | None = None
         for rule in valid_rules:
-            end, path = longest_dfa_match(rule["dfa"], source, pos)
+            end, path = longest_dfa_match(machines[rule["index"]], source, pos)
             length = max(0, end - pos)
             candidates.append(
                 {

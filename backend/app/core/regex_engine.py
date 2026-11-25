@@ -16,6 +16,12 @@ _WORD = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 _DIGIT = "0123456789"
 _SPACE = " \t\n\r\f\v"
 _PRINTABLE = "".join(chr(i) for i in range(32, 127))
+# Universe used for negated classes ([^...], \D, \W, \S): printable ASCII plus
+# the common whitespace controls, so e.g. "[^\"]*" also spans tabs and newlines.
+_UNIVERSE = _PRINTABLE + "\t\n\r"
+# The wildcard "." follows the usual convention and does not match a newline,
+# so a rule such as "//.*" stops at the end of the line.
+NEWLINE = "\n"
 _MAX_STATES = 900
 
 
@@ -82,9 +88,9 @@ def _escape_class(ch: str) -> set[str] | None:
     if ch == "s":
         return set(_SPACE)
     if ch == "D":
-        return set(_PRINTABLE) - set(_DIGIT)
+        return set(_UNIVERSE) - set(_DIGIT)
     if ch == "W":
-        return set(_PRINTABLE) - set(_WORD)
+        return set(_UNIVERSE) - set(_WORD)
     if ch == "S":
         return set(_PRINTABLE) - set(_SPACE)
     return None
@@ -144,7 +150,7 @@ def _tokenize(pattern: str) -> list[dict[str, Any]]:
             body = "".join(body_chars)
             chars = _class_chars(body, start + 1)
             if negate:
-                chars = set(_PRINTABLE) - chars
+                chars = set(_UNIVERSE) - chars
             tokens.append({"kind": _CLASS, "chars": sorted(chars), "pos": start})
             i += 1
         elif ch == "\\":
@@ -395,10 +401,17 @@ def _epsilon_closure(states: list[dict[str, Any]], seed: set[int]) -> set[int]:
 
 
 def _move(states: list[dict[str, Any]], seed: set[int], symbol: str) -> set[int]:
+    """move(S, a) for the subset construction.
+
+    The wildcard is not an ordinary symbol: an NFA edge labelled Σ is also taken
+    on every concrete character (except newline).  The DFA column Σ therefore
+    stands for "any character not named elsewhere in the alphabet".
+    """
     out: set[int] = set()
     for s in seed:
         for tr in states[s]["transitions"]:
-            if tr["symbol"] == symbol:
+            sym = tr["symbol"]
+            if sym == symbol or (sym == ANY and symbol != NEWLINE):
                 out.add(tr["to"])
     return out
 
@@ -510,10 +523,20 @@ def analyze_regex(pattern: str) -> dict[str, Any]:
             }
         )
 
+        raw_dfa = {
+            "start": "D0",
+            "states": dfa_states,
+            "transitions": dfa_transitions,
+            "alphabet": alphabet,
+            "accepting": [s["id"] for s in dfa_states if s["accepting"]],
+        }
+        minimal = minimize_dfa(raw_dfa)
+
         return {
             "valid": True,
             "pattern": pattern,
             "ast": render_ast(ast),
+            "minDfa": minimal,
             "nfa": {
                 "start": start,
                 "accepting": [accept],
@@ -536,6 +559,7 @@ def analyze_regex(pattern: str) -> dict[str, Any]:
                 "epsilonEdges": sum(len(s["epsilon"]) for s in states),
                 "dfaStates": len(dfa_sets),
                 "dfaEdges": len(dfa_transitions),
+                "minDfaStates": len(minimal["states"]),
                 "alphabetSize": len([s for s in alphabet if s != ANY]),
                 "hasWildcard": ANY in alphabet,
             },
@@ -544,34 +568,167 @@ def analyze_regex(pattern: str) -> dict[str, Any]:
         return {"valid": False, "pattern": pattern, "error": exc.as_dict()}
 
 
+def minimize_dfa(dfa: dict[str, Any]) -> dict[str, Any]:
+    """Minimise a DFA by partition refinement (Moore's algorithm).
+
+    Missing transitions are treated as edges to an implicit dead state, so the
+    input does not need to be complete.  Every refinement round is recorded so
+    the interface can show *why* two states were split or merged.
+    """
+    ids = [s["id"] for s in dfa["states"]]
+    alphabet = list(dfa["alphabet"])
+    trans = {(t["from"], t["symbol"]): t["to"] for t in dfa["transitions"]}
+    accepting = set(dfa["accepting"])
+
+    def label(block: list[str]) -> str:
+        return "{" + ", ".join(block) + "}"
+
+    block_of: dict[str, int] = {}
+    groups = [g for g in ([s for s in ids if s in accepting], [s for s in ids if s not in accepting]) if g]
+    for bi, g in enumerate(groups):
+        for s in g:
+            block_of[s] = bi
+    steps: list[dict[str, Any]] = [
+        {
+            "round": 0,
+            "partition": [list(g) for g in groups],
+            "explanation": "Start with two blocks: accepting states "
+            + label([s for s in ids if s in accepting])
+            + " and non-accepting states "
+            + label([s for s in ids if s not in accepting])
+            + ". States in different blocks can never be equivalent.",
+        }
+    ]
+
+    round_no = 0
+    while True:
+        round_no += 1
+        signatures: dict[tuple[Any, ...], list[str]] = {}
+        order: list[tuple[Any, ...]] = []
+        for s in ids:
+            sig = (block_of[s],) + tuple(
+                block_of[trans[(s, a)]] if (s, a) in trans else -1 for a in alphabet
+            )
+            if sig not in signatures:
+                signatures[sig] = []
+                order.append(sig)
+            signatures[sig].append(s)
+        new_groups = [signatures[sig] for sig in order]
+        if len(new_groups) == len(groups):
+            steps.append(
+                {
+                    "round": round_no,
+                    "partition": [list(g) for g in groups],
+                    "explanation": f"Round {round_no}: no block splits, so the partition is stable. "
+                    f"{len(ids)} DFA states collapse into {len(groups)} minimal states.",
+                }
+            )
+            break
+        splits = []
+        for old in groups:
+            pieces = [g for g in new_groups if g[0] in old]
+            if len(pieces) > 1:
+                splits.append(f"{label(old)} splits into " + " and ".join(label(p) for p in pieces))
+        groups = new_groups
+        block_of = {s: bi for bi, g in enumerate(groups) for s in g}
+        steps.append(
+            {
+                "round": round_no,
+                "partition": [list(g) for g in groups],
+                "explanation": f"Round {round_no}: "
+                + "; ".join(splits)
+                + " because their transitions lead into different blocks.",
+            }
+        )
+
+    # Renumber so the block containing the start state becomes M0, then BFS order.
+    start_block = block_of[dfa["start"]]
+    rep = {bi: g[0] for bi, g in enumerate(groups)}
+    numbering: dict[int, int] = {start_block: 0}
+    queue: deque[int] = deque([start_block])
+    while queue:
+        b = queue.popleft()
+        for a in alphabet:
+            t = trans.get((rep[b], a))
+            if t is not None and block_of[t] not in numbering:
+                numbering[block_of[t]] = len(numbering)
+                queue.append(block_of[t])
+    for bi in range(len(groups)):
+        numbering.setdefault(bi, len(numbering))
+
+    name = lambda bi: f"M{numbering[bi]}"
+    states = sorted(
+        (
+            {
+                "id": name(bi),
+                "dfaStates": list(g),
+                "accepting": g[0] in accepting,
+                "start": bi == start_block,
+            }
+            for bi, g in enumerate(groups)
+        ),
+        key=lambda s: int(s["id"][1:]),
+    )
+    transitions = []
+    for bi in sorted(range(len(groups)), key=lambda b: numbering[b]):
+        for a in alphabet:
+            t = trans.get((rep[bi], a))
+            if t is not None:
+                transitions.append({"from": name(bi), "symbol": a, "to": name(block_of[t])})
+    return {
+        "start": "M0",
+        "states": states,
+        "transitions": transitions,
+        "alphabet": alphabet,
+        "accepting": [s["id"] for s in states if s["accepting"]],
+        "steps": steps,
+        "removed": len(ids) - len(groups),
+    }
+
+
+def compile_dfa(dfa: dict[str, Any]) -> dict[str, Any]:
+    """Pre-index a DFA so repeated matching does not rebuild lookup tables."""
+    return {
+        "start": dfa["start"],
+        "trans": {(t["from"], t["symbol"]): t["to"] for t in dfa["transitions"]},
+        "accepting": set(dfa["accepting"]),
+        "compiled": True,
+    }
+
+
+def _step(trans: dict[tuple[str, str], str], current: str, ch: str) -> str | None:
+    nxt = trans.get((current, ch))
+    if nxt is None and ch != NEWLINE:
+        nxt = trans.get((current, ANY))
+    return nxt
+
+
 def dfa_accepts(dfa: dict[str, Any], text: str) -> bool:
     """Convenience predicate used by tests and the lexer."""
-    current = dfa["start"]
-    trans: dict[tuple[str, str], str] = {(t["from"], t["symbol"]): t["to"] for t in dfa["transitions"]}
+    machine = dfa if dfa.get("compiled") else compile_dfa(dfa)
+    current = machine["start"]
     for ch in text:
-        if (current, ch) in trans:
-            current = trans[(current, ch)]
-        elif (current, ANY) in trans:
-            current = trans[(current, ANY)]
-        else:
+        current = _step(machine["trans"], current, ch)
+        if current is None:
             return False
-    return current in dfa["accepting"]
+    return current in machine["accepting"]
 
 
 def longest_dfa_match(dfa: dict[str, Any], text: str, start: int = 0) -> tuple[int, list[str]]:
-    """Return (end offset, state path) for the longest accepting prefix."""
-    current = dfa["start"]
-    trans: dict[tuple[str, str], str] = {(t["from"], t["symbol"]): t["to"] for t in dfa["transitions"]}
-    accepting = set(dfa["accepting"])
+    """Return (end offset, state path) for the longest accepting prefix.
+
+    *dfa* may be a raw DFA record or the result of :func:`compile_dfa`.
+    """
+    machine = dfa if dfa.get("compiled") else compile_dfa(dfa)
+    current = machine["start"]
+    trans = machine["trans"]
+    accepting = machine["accepting"]
     path = [current]
     best_end = start if current in accepting else -1
     best_path = list(path)
     i = start
     while i < len(text):
-        ch = text[i]
-        nxt = trans.get((current, ch))
-        if nxt is None:
-            nxt = trans.get((current, ANY))
+        nxt = _step(trans, current, text[i])
         if nxt is None:
             break
         current = nxt

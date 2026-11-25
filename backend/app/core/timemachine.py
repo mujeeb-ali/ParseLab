@@ -136,7 +136,18 @@ def run_time_machine(payload: dict[str, Any]) -> dict[str, Any]:
             lex_errors = lex_result["errors"]
             mapped, mapping_errors = _map_lex_tokens(lex_result["tokens"], g["terminals"], token_map)
             input_tokens = mapped
-            if mapping_errors:
+            if lex_result.get("ruleErrors"):
+                bad = lex_result["ruleErrors"][0]
+                token_error = f"Lexer rule {bad.get('name') or '#' + str(bad['rule'] + 1)} is invalid: {bad['message']}"
+            elif lex_errors:
+                # A program with characters no rule can match is not a valid
+                # program, even if the remaining tokens happen to parse.
+                first = lex_errors[0]
+                token_error = (
+                    f"Lexical error at line {first['line']}, column {first['column']}: {first['message']} "
+                    f"Syntax analysis is skipped because the token stream is incomplete."
+                )
+            elif mapping_errors:
                 token_error = mapping_errors[0]["message"]
             add_step(
                 "source",

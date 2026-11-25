@@ -48,11 +48,20 @@ def parse_grammar(text: str) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     raw_productions: list[dict[str, Any]] = []
     start_override: str | None = None
+    last_lhs: str | None = None
 
     for line_no, raw_line in enumerate(text.splitlines(), start=1):
         line = _strip_comment(raw_line).strip()
         if not line:
             continue
+        # Textbook layout: an alternative on its own line, e.g.
+        #   E -> E + T
+        #      | T
+        if line.startswith("|"):
+            if last_lhs is None:
+                errors.append({"line": line_no, "message": "A line starting with '|' must follow a production."})
+                continue
+            line = f"{last_lhs} -> {line[1:]}"
         if line.startswith("%start"):
             parts = line.split()
             if len(parts) != 2:
@@ -64,7 +73,10 @@ def parse_grammar(text: str) -> dict[str, Any]:
             warnings.append({"line": line_no, "message": f"Unknown directive '{line.split()[0]}' ignored."})
             continue
 
-        arrow = next((a for a in _ARROWS if a in line), None)
+        # Use the left-most arrow so that an arrow-like terminal later on the
+        # right-hand side cannot be mistaken for the separator.
+        found = [(line.find(a), -len(a), a) for a in _ARROWS if a in line]
+        arrow = min(found)[2] if found else None
         if arrow is None:
             errors.append({"line": line_no, "message": "Missing production arrow. Use '->' between the left and right sides."})
             continue
@@ -79,6 +91,7 @@ def parse_grammar(text: str) -> dict[str, Any]:
         if not _NAME_RE.match(lhs):
             errors.append({"line": line_no, "message": f"Invalid non-terminal '{lhs}'. Use letters, digits, underscore or a trailing prime."})
             continue
+        last_lhs = lhs
 
         alternatives = rhs_raw.split("|")
         if not alternatives:
@@ -418,10 +431,11 @@ def diagnose(g: dict[str, Any], nullable: dict[str, bool]) -> list[dict[str, Any
         issues.append(
             {
                 "id": "direct-left-recursion",
-                "severity": "error",
+                "severity": "warning",
+                "affects": ["LL(1)"],
                 "title": "Direct left recursion",
-                "detail": "A non-terminal can expand to itself at the left edge, so a top-down parser can loop forever. "
-                "SLR handles it, but LL(1) does not.",
+                "detail": "A non-terminal can expand to itself at the left edge. This is fine for bottom-up parsers "
+                "(SLR, LALR, LR(1)), but a top-down LL(1) parser would loop forever. Use “Eliminate left recursion” to get an LL(1)-friendly version.",
                 "symbols": sorted({p["lhs"] for p in direct}),
                 "productions": [p["index"] for p in direct],
                 "kind": "left-recursion",
@@ -429,13 +443,30 @@ def diagnose(g: dict[str, Any], nullable: dict[str, bool]) -> list[dict[str, Any
         )
 
     lc_graph = _left_corner_graph(g, nullable)
+    direct_lhs = {p["lhs"] for p in direct}
+    hidden = sorted(nt for nt in nts if nt in lc_graph[nt] and nt not in direct_lhs)
+    if hidden:
+        issues.append(
+            {
+                "id": "hidden-left-recursion",
+                "severity": "warning",
+                "affects": ["LL(1)"],
+                "title": "Hidden left recursion",
+                "detail": "A nullable prefix lets these non-terminals reach themselves at the left edge "
+                "(e.g. A → B A with B ⇒* ε). It is easy to miss, and it still breaks LL(1).",
+                "symbols": hidden,
+                "kind": "left-recursion",
+            }
+        )
+
     cycles = _find_cycles(lc_graph)
     indirect = [c for c in cycles if len(c) > 1]
     if indirect:
         issues.append(
             {
                 "id": "indirect-left-recursion",
-                "severity": "error",
+                "severity": "warning",
+                "affects": ["LL(1)"],
                 "title": "Indirect left recursion",
                 "detail": "A cycle in the left-corner graph means these non-terminals can reach themselves without consuming input.",
                 "symbols": indirect[0],
@@ -578,6 +609,7 @@ def analyze_grammar(text: str) -> dict[str, Any]:
         "issues": issues,
         "warnings": g["warnings"],
         "reachable": sorted(reachable),
+        "samples": sample_sentences(g),
         "stats": {
             "productions": len(g["productions"]),
             "nonterminals": len(g["nonterminals"]),
@@ -705,25 +737,233 @@ def tokenize_input(g: dict[str, Any], text: str) -> dict[str, Any]:
     if not text:
         return {"tokens": [], "error": None}
     terminals = sorted(g["terminals"], key=lambda s: (-len(s), s))
-    if any(ch.isspace() for ch in text):
-        raw = text.split()
-        unknown = [t for t in raw if t not in g["terminals"]]
-        if unknown:
-            return {
-                "tokens": raw,
-                "error": f"'{unknown[0]}' is not a terminal of this grammar. Terminals: {', '.join(g['terminals']) or 'none'}.",
-            }
-        return {"tokens": raw, "error": None}
+    terminal_set = set(g["terminals"])
 
+    # Whitespace always separates tokens; a chunk that is not itself a terminal
+    # is split by greedy longest match, so "id + id*id" works as expected.
     tokens: list[str] = []
-    i = 0
-    while i < len(text):
-        match = next((t for t in terminals if text.startswith(t, i)), None)
-        if match is None:
-            return {
-                "tokens": tokens,
-                "error": f"Unexpected character '{text[i]}' at position {i}. Use a terminal of the grammar or separate tokens with spaces.",
-            }
-        tokens.append(match)
-        i += len(match)
+    offset = 0
+    for chunk in text.split():
+        offset = text.index(chunk, offset)
+        if chunk in terminal_set:
+            tokens.append(chunk)
+            offset += len(chunk)
+            continue
+        i = 0
+        while i < len(chunk):
+            match = next((t for t in terminals if chunk.startswith(t, i)), None)
+            if match is None:
+                return {
+                    "tokens": tokens,
+                    "error": (
+                        f"Unexpected character '{chunk[i]}' at position {offset + i}. "
+                        f"Terminals of this grammar: {', '.join(g['terminals']) or 'none'}."
+                    ),
+                }
+            tokens.append(match)
+            i += len(match)
+        offset += len(chunk)
     return {"tokens": tokens, "error": None}
+
+
+# ---------------------------------------------------------------------------
+# Left-recursion elimination
+# ---------------------------------------------------------------------------
+
+
+def _fresh_name(base: str, existing: set[str]) -> str:
+    name = base + "'"
+    while name in existing:
+        name += "'"
+    existing.add(name)
+    return name
+
+
+def _format_grammar(order: list[str], rules: dict[str, list[list[str]]]) -> str:
+    lines = []
+    width = max((len(nt) for nt in order), default=1)
+    for nt in order:
+        alts = rules.get(nt) or []
+        if not alts:
+            continue
+        rendered = " | ".join(" ".join(a) if a else EPS for a in alts)
+        lines.append(f"{nt.ljust(width)} -> {rendered}")
+    return "\n".join(lines)
+
+
+def eliminate_left_recursion(text: str) -> dict[str, Any]:
+    """Remove direct and indirect left recursion (Aho et al., Algorithm 4.19).
+
+    Non-terminals are processed in order A1..An.  For each Ai we first
+    substitute Aj (j < i) into productions Ai -> Aj γ - but only when Aj can
+    actually left-derive Ai, so unrelated rules are not needlessly inlined -
+    then remove the direct recursion with a fresh primed non-terminal:
+
+        A -> A α | β      becomes      A -> β A'      A' -> α A' | ε
+    """
+    try:
+        g = parse_grammar(text)
+    except GrammarError as exc:
+        return {"valid": False, "errors": exc.errors}
+
+    order = list(g["nonterminals"])
+    rules: dict[str, list[list[str]]] = {nt: [] for nt in order}
+    for p in g["productions"]:
+        if p["rhs"] not in rules[p["lhs"]]:
+            rules[p["lhs"]].append(list(p["rhs"]))
+    existing = set(order) | set(g["terminals"])
+    steps: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    nullable, _ = compute_nullable(g)
+    if any(nullable[nt] and any(nt in alt[:1] for alts in rules.values() for alt in alts) for nt in order):
+        warnings.append(
+            "The grammar has nullable non-terminals in left position. The classic algorithm assumes no ε-productions, "
+            "so hidden left recursion may remain; check the diagnostics of the result."
+        )
+
+    def left_reaches(src: str, target: str) -> bool:
+        seen, stack = set(), [src]
+        while stack:
+            nt = stack.pop()
+            if nt == target:
+                return True
+            if nt in seen:
+                continue
+            seen.add(nt)
+            for alt in rules.get(nt, []):
+                if alt and alt[0] in rules:
+                    stack.append(alt[0])
+        return False
+
+    final_order: list[str] = []
+    for i, ai in enumerate(order):
+        for aj in order[:i]:
+            if not any(alt and alt[0] == aj for alt in rules[ai]):
+                continue
+            if not left_reaches(aj, ai):
+                continue
+            new_alts: list[list[str]] = []
+            for alt in rules[ai]:
+                if alt and alt[0] == aj:
+                    for delta in rules[aj]:
+                        cand = delta + alt[1:]
+                        if cand not in new_alts:
+                            new_alts.append(cand)
+                else:
+                    if alt not in new_alts:
+                        new_alts.append(alt)
+            steps.append(
+                {
+                    "kind": "substitute",
+                    "nonterminal": ai,
+                    "into": aj,
+                    "explanation": f"{ai} has alternatives starting with {aj}, and {aj} can left-derive {ai}. "
+                    f"Substitute {aj}'s right-hand sides to expose the indirect recursion.",
+                    "after": f"{ai} -> " + " | ".join(" ".join(a) if a else EPS for a in new_alts),
+                }
+            )
+            rules[ai] = new_alts
+
+        recursive = [alt[1:] for alt in rules[ai] if alt and alt[0] == ai]
+        others = [alt for alt in rules[ai] if not (alt and alt[0] == ai)]
+        final_order.append(ai)
+        if not recursive:
+            continue
+        # A -> A (pure self-loop) contributes nothing to the language.
+        recursive = [a for a in recursive if a]
+        if not others:
+            warnings.append(f"{ai} has no non-left-recursive alternative, so it derives no finite string.")
+        prime = _fresh_name(ai, existing)
+        rules[ai] = [beta + [prime] for beta in others] or [[prime]]
+        rules[prime] = [alpha + [prime] for alpha in recursive] + [[]]
+        final_order.append(prime)
+        steps.append(
+            {
+                "kind": "direct",
+                "nonterminal": ai,
+                "newNonterminal": prime,
+                "explanation": f"Remove direct left recursion on {ai}: the β alternatives "
+                f"({' | '.join(' '.join(b) if b else EPS for b in others) or 'none'}) start {ai}, and the α tails "
+                f"({' | '.join(' '.join(a) for a in recursive) or 'none'}) repeat through the new {prime}.",
+                "after": f"{ai} -> " + " | ".join(" ".join(a) for a in rules[ai])
+                + f"\n{prime} -> " + " | ".join(" ".join(a) if a else EPS for a in rules[prime]),
+            }
+        )
+
+    result_text = _format_grammar(final_order, rules)
+    return {
+        "valid": True,
+        "text": result_text,
+        "steps": steps,
+        "warnings": warnings,
+        "changed": bool(steps),
+        "analysis": analyze_grammar(result_text),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Example sentences
+# ---------------------------------------------------------------------------
+
+
+def _shortest_yields(g: dict[str, Any]) -> dict[str, list[str]]:
+    """Shortest terminal string each productive non-terminal can derive (fixed point)."""
+    best: dict[str, list[str]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for p in g["productions"]:
+            parts: list[str] = []
+            ok = True
+            for sym in p["rhs"]:
+                if sym in g["nonterminals"]:
+                    if sym not in best:
+                        ok = False
+                        break
+                    parts.extend(best[sym])
+                else:
+                    parts.append(sym)
+            if ok and (p["lhs"] not in best or len(parts) < len(best[p["lhs"]])):
+                best[p["lhs"]] = parts
+                changed = True
+    return best
+
+
+def sample_sentences(g: dict[str, Any], count: int = 4, seed: int = 0, max_len: int = 18) -> list[str]:
+    """The shortest sentence plus a few random ones, all derivable from the start symbol."""
+    import random
+
+    best = _shortest_yields(g)
+    if g["start"] not in best:
+        return []
+    by_lhs: dict[str, list[list[str]]] = {}
+    for p in g["productions"]:
+        if all(s not in g["nonterminals"] or s in best for s in p["rhs"]):
+            by_lhs.setdefault(p["lhs"], []).append(p["rhs"])
+    rng = random.Random(seed)
+
+    def expand(sym: str, depth: int, budget: list[int]) -> list[str]:
+        if sym not in g["nonterminals"]:
+            budget[0] -= 1
+            return [sym]
+        if depth > 5 or budget[0] <= len(best[sym]):
+            out = list(best[sym])  # head for termination
+            budget[0] -= len(out)
+            return out
+        rhs = rng.choice(by_lhs[sym])
+        out: list[str] = []
+        for s in rhs:
+            out.extend(expand(s, depth + 1, budget))
+        return out
+
+    results: list[str] = []
+    shortest = " ".join(best[g["start"]])
+    results.append(shortest)
+    for _ in range(count * 6):
+        if len(results) >= count:
+            break
+        sentence = " ".join(expand(g["start"], 0, [max_len]))
+        if sentence not in results and len(sentence.split()) <= max_len + 4:
+            results.append(sentence)
+    return results

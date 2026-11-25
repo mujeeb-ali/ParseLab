@@ -78,6 +78,14 @@ E -> cond"""
 
 AMBIGUOUS = """E -> E + E | E * E | id"""
 
+POINTER_ASSIGN = """S -> L = R | R
+L -> * R | id
+R -> L"""
+
+LR1_NOT_LALR = """S -> a A d | b B d | a B e | b A e
+A -> c
+B -> c"""
+
 UNIT_CYCLE = """S -> A
 A -> B | a
 B -> A | b"""
@@ -292,6 +300,28 @@ EXAMPLES: list[dict[str, Any]] = [
         "tags": ["SLR", "assignment", "reductions"],
         "difficulty": "advanced",
         "payload": {"grammar": ASSIGN_LL, "input": "id = id + num * id ;"},
+    },
+    {
+        "id": "lalr-pointer-assignment",
+        "title": "Pointer assignment: LALR beats SLR",
+        "kind": "slr",
+        "kicker": "LR / 03",
+        "tagline": "The Dragon Book's favourite counter-example",
+        "description": "S -> L = R | R with C-style pointers. SLR reports a shift/reduce conflict on '=' because = is in FOLLOW(R); LALR(1) lookaheads show the reduction is never needed there.",
+        "tags": ["LALR(1)", "SLR conflict", "lookaheads"],
+        "difficulty": "advanced",
+        "payload": {"grammar": POINTER_ASSIGN, "input": "* id = id", "method": "lalr"},
+    },
+    {
+        "id": "lr1-not-lalr",
+        "title": "Where LALR merging fails",
+        "kind": "slr",
+        "kicker": "LR / 04",
+        "tagline": "Canonical LR(1) is strictly stronger",
+        "description": "Two LR(1) states share a core but disagree on lookaheads. Merging them for LALR(1) creates a reduce/reduce conflict; canonical LR(1) keeps them apart.",
+        "tags": ["LR(1)", "LALR(1)", "reduce/reduce"],
+        "difficulty": "advanced",
+        "payload": {"grammar": LR1_NOT_LALR, "input": "a c d", "method": "lr1"},
     },
     {
         "id": "time-arith-ll",
